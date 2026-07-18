@@ -1356,6 +1356,18 @@ def cmd_teardown(
         console.print("[dim]No running quelltest containers found.[/dim]")
 
 
+@app.command("mcp")
+def cmd_mcp() -> None:
+    """Run the local MCP server (stdio) so AI agents can operate Quelltest.
+
+    Register in your project's .mcp.json:
+        {"mcpServers": {"quelltest": {"command": "quelltest-mcp"}}}
+    """
+    from quell.mcp_server import main as mcp_main
+
+    mcp_main()
+
+
 # ── Graph subcommands ─────────────────────────────────────────────────────────
 
 

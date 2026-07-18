@@ -1,213 +1,275 @@
-"""
-Quell MCP Server — exposes Quell's engine to AI coding agents.
+"""Quell local MCP server — lets AI agents operate Quelltest directly (spec9 §3).
 
-AI agents (Claude Code, Cursor, Devin) can call these tools to verify
-tests they generate before committing, without any manual steps.
+Claude Code, Claude Desktop, Cursor, or any MCP client spawns this over stdio
+and can find untested edge cases, write Gate-5-verified tests, score the
+project, and reproduce bugs — against the local working tree, with no cloud,
+no OAuth, and no network. Nothing leaves the machine.
 
 Run:
-    uvx quell-mcp
-    python -m quell.mcp_server
+    quelltest-mcp              # console script (stdio)
+    python -m quell.mcp_server # equivalent
+    quell mcp                  # CLI alias
+
+Register in a project's .mcp.json:
+    {"mcpServers": {"quelltest": {"command": "quelltest-mcp"}}}
 
 Requires:
-    pip install quell[mcp]   # installs mcp>=1.0.0
+    pip install "quelltest[mcp]"
 
-Tools exposed:
-    verify_test          — verify a test kills mutations in a source file
-    get_survivors        — list surviving mutants for a file
-    generate_killing_test — generate a verified killing test for a mutant
-    get_quell_score      — get current mutation score
+Tool implementations are plain functions (testable without the mcp package);
+FastMCP registration happens only inside create_server()/main(). Tools are
+sync on purpose: FastMCP executes sync tools in a worker thread, which keeps
+the SDK's internal asyncio.run() calls legal.
 """
 from __future__ import annotations
 
-import asyncio
+import json
 import sys
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import Any
 
-if TYPE_CHECKING:
-    from mcp.server import Server
+# ── tool implementations (no mcp dependency) ─────────────────────────────────
+
+
+def _root() -> Path:
+    """Project root = the directory the MCP client spawned us in."""
+    return Path.cwd().resolve()
+
+
+def _resolve_target(path: str, root: Path) -> Path | None:
+    """Resolve a user/agent-supplied path inside the project root."""
+    candidate = Path(path) if Path(path).is_absolute() else root / path
+    candidate = candidate.resolve()
+    if not candidate.exists():
+        return None
+    return candidate
+
+
+def _requirement_dict(req: Any) -> dict[str, Any]:
+    return {
+        "id": req.id,
+        "description": req.description,
+        "constraint_kind": req.constraint_kind.value,
+        "function": req.target_function,
+        "file": str(req.target_file),
+        "line": req.source_line,
+        "covered": req.is_covered,
+    }
+
+
+def impl_find_edge_cases(
+    path: str = ".",
+    sources: list[str] | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Scan for testable requirements and report which have no test (read-only)."""
+    root = root or _root()
+    target = _resolve_target(path, root)
+    if target is None:
+        return {"error": f"Path not found: {path}"}
+    try:
+        from quell.sdk import Quell
+
+        result = Quell(project_root=root).check(target, sources=sources, fix=False)
+        uncovered = [_requirement_dict(r) for r in result.uncovered]
+        return {
+            "total_requirements": len(result.requirements),
+            "covered": len(result.covered),
+            "uncovered": len(uncovered),
+            "coverage_percent": round(result.score * 100, 1),
+            "gaps": uncovered,
+            "note": "Run write_verified_tests to generate Gate-5-proven tests for these gaps.",
+        }
+    except Exception as exc:  # noqa: BLE001 — tools must never raise into the transport
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def impl_write_verified_tests(path: str = ".", root: Path | None = None) -> dict[str, Any]:
+    """Generate tests for every gap, verify through all 5 gates, write only proven ones."""
+    root = root or _root()
+    target = _resolve_target(path, root)
+    if target is None:
+        return {"error": f"Path not found: {path}"}
+    try:
+        from quell.sdk import Quell
+
+        result = Quell(project_root=root).check(target, fix=True)
+        summary: dict[str, Any] = {
+            "total_requirements": len(result.requirements),
+            "coverage_percent_after": round(result.score * 100, 1),
+            "report_path": str(result.report_path) if result.report_path else None,
+        }
+        if result.report_path and Path(result.report_path).exists():
+            try:
+                report = json.loads(Path(result.report_path).read_text(encoding="utf-8"))
+                for key in (
+                    "written",
+                    "already_covered",
+                    "fails_on_correct",
+                    "doesnt_catch_violation",
+                    "timeout",
+                    "error",
+                    "skipped",
+                ):
+                    if key in report:
+                        summary[key] = report[key]
+            except Exception:  # noqa: BLE001 — summary without bucket detail is still useful
+                pass
+        summary["note"] = (
+            "Only tests that passed all 5 gates (including Gate 5: violation "
+            "injection) were written to disk. Others were discarded, never written."
+        )
+        return summary
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def impl_get_prs_score(root: Path | None = None) -> dict[str, Any]:
+    """Project-wide requirement-coverage score with per-file breakdown."""
+    root = root or _root()
+    try:
+        from quell.sdk import Quell
+
+        score = Quell(project_root=root).score()
+        pct = score.percentage
+        tier = (
+            "Production Ready" if pct >= 80
+            else "Review Needed" if pct >= 60
+            else "Needs Work"
+        )
+        return {
+            "score_percent": pct,
+            "tier": tier,
+            "files": [
+                {
+                    "file": str(getattr(f, "path", getattr(f, "file", ""))),
+                    "total_requirements": f.total_requirements,
+                    "covered_requirements": f.covered_requirements,
+                }
+                for f in score.files
+            ],
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def impl_prove_file(
+    file: str,
+    function: str | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Requirement-coverage ratio for a single file (optionally one function)."""
+    root = root or _root()
+    target = _resolve_target(file, root)
+    if target is None:
+        return {"error": f"File not found: {file}"}
+    try:
+        from quell.sdk import Quell
+
+        ratio = Quell(project_root=root).prove(target, function=function)
+        return {
+            "file": str(target),
+            "function": function,
+            "coverage_percent": round(ratio * 100, 1),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def impl_reproduce_bug(
+    description: str,
+    file: str | None = None,
+    root: Path | None = None,
+) -> dict[str, Any]:
+    """Turn a natural-language bug description into a verified failing test."""
+    root = root or _root()
+    target: Path | None = None
+    if file is not None:
+        target = _resolve_target(file, root)
+        if target is None:
+            return {"error": f"File not found: {file}"}
+    try:
+        from quell.sdk import Quell
+
+        written = Quell(project_root=root).reproduce(description, file=target)
+        return {
+            "test_written": written,
+            "note": (
+                "A failing test proving the bug was written to disk."
+                if written
+                else "Could not produce a verified failing test for this description."
+            ),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+# ── FastMCP registration ─────────────────────────────────────────────────────
+
+
+def create_server() -> Any:
+    """Build the FastMCP server. Raises ImportError if mcp is not installed."""
+    from mcp.server.fastmcp import FastMCP
+
+    mcp = FastMCP(
+        "quelltest",
+        instructions=(
+            "Quelltest finds untested edge cases in the current Python project "
+            "and writes pytest tests proven (via violation injection) to catch "
+            "real bugs. Typical flow: find_edge_cases -> write_verified_tests -> "
+            "get_prs_score. Everything runs locally; no code leaves the machine."
+        ),
+    )
+
+    @mcp.tool()
+    def find_edge_cases(path: str = ".", sources: list[str] | None = None) -> dict:
+        """Scan a file or directory for documented requirements (docstrings,
+        Pydantic models, type hints) that have no test. Read-only — writes
+        nothing. Returns the gap list with file and line locations."""
+        return impl_find_edge_cases(path, sources)
+
+    @mcp.tool()
+    def write_verified_tests(path: str = ".") -> dict:
+        """Generate a pytest test for every uncovered requirement under path,
+        run each through the 5-gate pipeline (Gate 5 injects the violation and
+        requires the test to fail), and write only proven tests to disk."""
+        return impl_write_verified_tests(path)
+
+    @mcp.tool()
+    def get_prs_score() -> dict:
+        """Project-wide requirement-coverage score (0-100) with tier
+        (Production Ready / Review Needed / Needs Work) and per-file detail."""
+        return impl_get_prs_score()
+
+    @mcp.tool()
+    def prove_file(file: str, function: str | None = None) -> dict:
+        """Coverage ratio for one file, optionally narrowed to one function.
+        Use after editing a function to check whether its documented behavior
+        is tested."""
+        return impl_prove_file(file, function)
+
+    @mcp.tool()
+    def reproduce_bug(description: str, file: str | None = None) -> dict:
+        """Convert a natural-language bug description into a verified failing
+        pytest test (e.g. 'payment accepts zero amount'). Optionally scope to
+        a file."""
+        return impl_reproduce_bug(description, file)
+
+    return mcp
 
 
 def main() -> None:
-    """Entry point for the quell-mcp CLI command."""
+    """Console-script entry point (stdio transport)."""
     try:
-        from mcp.server import Server as _Server  # noqa: F401
-        from mcp.server.stdio import stdio_server as _stdio  # noqa: F401
+        server = create_server()
     except ImportError:
         print(
-            "Error: mcp package is required.\n"
-            "Install it with: pip install quell[mcp]",
+            "Error: the 'mcp' package is required for the Quelltest MCP server.\n"
+            'Install it with: pip install "quelltest[mcp]"',
             file=sys.stderr,
         )
         sys.exit(1)
-
-    asyncio.run(_run_server())
-
-
-async def _run_server() -> None:
-    """Start the MCP server and serve over stdio."""
-    from mcp.server import Server
-    from mcp.server.stdio import stdio_server
-
-    server = Server("quell")
-    _register_tools(server)
-
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(
-            read_stream,
-            write_stream,
-            server.create_initialization_options(),
-        )
-
-
-def _register_tools(server: Server) -> None:
-    """Register all Quell MCP tools on the server."""
-
-    @server.tool()
-    async def verify_test(test_code: str, source_file: str) -> dict:
-        """
-        Verify that a test actually kills mutations in the source file.
-
-        The test must pass on original code and fail when a mutant is applied.
-        Use this after generating a test to confirm it catches real bugs.
-
-        Returns:
-            {verified: bool, kills_mutants: int, score_delta: float, explanation: str}
-        """
-        from quell.sdk import Quell
-
-        q = Quell(project_root=Path("."))
-        result = q.verify_test(test_code=test_code, source_file=source_file)
-        return {
-            "verified": result.verified,
-            "kills_mutants": result.kills_mutants,
-            "score_delta": result.score_delta,
-            "explanation": result.explanation,
-            "status": result.status,
-        }
-
-    @server.tool()
-    async def get_survivors(source_file: str) -> list[dict]:
-        """
-        Get all surviving mutants for a source file.
-
-        Returns a list of mutants that your tests are not killing.
-        Each mutant describes the exact code change that slipped through.
-        """
-        from quell.adapters.mutmut_adapter import MutmutAdapter
-        from quell.core.analyzer import MutationAnalyzer
-
-        adapter = MutmutAdapter(Path("."))
-        analyzer = MutationAnalyzer()
-        survivors = adapter.read_survivors()
-        survivors = [analyzer.analyze(m) for m in survivors]
-
-        target = Path(source_file).resolve()
-        file_survivors = [
-            m for m in survivors
-            if m.file_path.resolve() == target
-        ]
-
-        return [
-            {
-                "id": m.id,
-                "file": str(m.file_path),
-                "line": m.line_start,
-                "operator": m.operator.value,
-                "original": m.original_code.strip(),
-                "mutated": m.mutated_code.strip(),
-                "function": m.function_name,
-            }
-            for m in file_survivors
-        ]
-
-    @server.tool()
-    async def generate_killing_test(mutant_id: str, source_file: str) -> dict:
-        """
-        Generate a verified killing test for a specific mutant.
-
-        The returned test has been verified to kill the mutant and pass
-        on the original code. It is ready to be written to the test file.
-
-        Returns:
-            {test_code: str, test_function_name: str, verified: bool, explanation: str}
-        """
-        from quell.adapters.mutmut_adapter import MutmutAdapter
-        from quell.core.analyzer import MutationAnalyzer
-        from quell.core.generator import TestGenerator
-        from quell.core.models import QuellConfig, VerificationStatus
-        from quell.core.verifier import MutantVerifier
-        from quell.llm.client import LLMClient
-
-        config = QuellConfig()
-        llm = LLMClient.from_config(config)
-        generator = TestGenerator(llm, config)
-        verifier = MutantVerifier(config)
-        analyzer = MutationAnalyzer()
-
-        adapter = MutmutAdapter(Path("."))
-        survivors = adapter.read_survivors()
-        survivors = [analyzer.analyze(m) for m in survivors]
-
-        target = next((m for m in survivors if m.id == mutant_id), None)
-        if target is None:
-            return {
-                "test_code": "",
-                "test_function_name": "",
-                "verified": False,
-                "explanation": f"Mutant {mutant_id} not found in survivors.",
-            }
-
-        generated = await generator.generate(target)
-        for _ in range(config.max_verification_attempts):
-            vr = verifier.verify(target, generated)
-            if vr.status == VerificationStatus.VERIFIED:
-                return {
-                    "test_code": generated.test_code,
-                    "test_function_name": generated.test_function_name,
-                    "verified": True,
-                    "explanation": generated.explanation,
-                }
-            generated = await generator.generate(target)
-
-        return {
-            "test_code": generated.test_code,
-            "test_function_name": generated.test_function_name,
-            "verified": False,
-            "explanation": (
-                f"Could not generate a verified killing test after "
-                f"{config.max_verification_attempts} attempts."
-            ),
-        }
-
-    @server.tool()
-    async def get_quell_score(file_path: str | None = None) -> dict:
-        """
-        Get current mutation score.
-
-        Args:
-            file_path: Optional file path to get score for a single file.
-                       If None, returns the project-wide score.
-
-        Returns:
-            {total: float, percentage: int, grade: str, by_file: dict}
-        """
-        from quell.sdk import Quell
-
-        q = Quell(project_root=Path("."))
-        score = q.get_score(path=file_path)
-
-        grade = "A" if score.total >= 0.80 else "B" if score.total >= 0.60 else "C" if score.total >= 0.40 else "F"
-
-        return {
-            "total": score.total,
-            "percentage": score.percentage,
-            "grade": grade,
-            "by_file": score.by_file,
-            "total_mutants": score.total_mutants,
-            "killed_mutants": score.killed_mutants,
-            "survived_mutants": score.survived_mutants,
-        }
+    server.run()  # stdio is FastMCP's default transport
 
 
 if __name__ == "__main__":

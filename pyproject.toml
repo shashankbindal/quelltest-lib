@@ -56,7 +56,8 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-mcp = ["mcp>=1.0.0"]
+# Local MCP server for AI agents (Claude Code, Cursor) — pip install "quelltest[mcp]"
+mcp = ["mcp>=1.2.0"]
 pyspark = ["pyspark>=3.4.0"]
 # LLM fallback via Groq (spec7 §3) — pip install quelltest[groq]
 groq = ["groq>=0.9.0"]
@@ -74,6 +75,7 @@ dev = [
 
 [project.scripts]
 quell = "quell.cli:app"
+quelltest-mcp = "quell.mcp_server:main"
 
 [project.urls]
 Homepage = "https://quelltest.com"

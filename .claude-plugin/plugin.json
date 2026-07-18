@@ -1,0 +1,25 @@
+{
+  "name": "quelltest",
+  "version": "2.1.0",
+  "description": "Prove your Python tests, don't just count them. Quelltest finds untested edge cases (docstrings, Pydantic models, type hints), writes pytest tests verified through a 5-gate pipeline — Gate 5 injects the violation and requires the test to fail — and scores production readiness. This plugin teaches Claude to operate Quelltest directly via its local MCP server or CLI: find gaps after writing code, write proven tests before committing, reproduce bugs as failing tests. Everything runs locally; no code leaves the machine.",
+  "author": {
+    "name": "Shashank Bindal",
+    "url": "https://github.com/quelltest"
+  },
+  "license": "MIT",
+  "homepage": "https://quelltest.com",
+  "repository": "https://github.com/quelltest/quelltest-lib",
+  "keywords": [
+    "python",
+    "testing",
+    "pytest",
+    "test-generation",
+    "edge-cases",
+    "verification",
+    "mutation-testing",
+    "production-readiness",
+    "docstrings",
+    "pydantic",
+    "mcp"
+  ]
+}

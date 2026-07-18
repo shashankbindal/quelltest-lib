@@ -1,0 +1,33 @@
+{
+  "$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+  "name": "quelltest",
+  "owner": {
+    "name": "Shashank Bindal"
+  },
+  "metadata": {
+    "description": "Quelltest for Claude Code — find untested edge cases in Python and write Gate-5-proven pytest tests, directly from your agent session."
+  },
+  "plugins": [
+    {
+      "name": "quelltest",
+      "source": "./",
+      "description": "Prove your Python tests, don't just count them. Find untested edge cases, write pytest tests verified via violation injection, score production readiness — all locally.",
+      "author": {
+        "name": "Shashank Bindal",
+        "url": "https://github.com/quelltest"
+      },
+      "category": "testing",
+      "homepage": "https://quelltest.com",
+      "keywords": [
+        "python",
+        "testing",
+        "pytest",
+        "test-generation",
+        "edge-cases",
+        "verification",
+        "production-readiness",
+        "mcp"
+      ]
+    }
+  ]
+}

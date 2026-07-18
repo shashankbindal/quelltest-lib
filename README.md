@@ -243,6 +243,37 @@ print(f"PRS: {result.score}  |  Gaps: {len(result.uncovered)}")
 
 ---
 
+## AI agents (Claude Code, Cursor, Claude Desktop)
+
+Quelltest ships a **local MCP server** so agents can operate it directly —
+find gaps, write Gate-5-proven tests, score the project — without touching a
+terminal. Everything runs on your machine; no cloud, no network.
+
+```bash
+pip install "quelltest[mcp]"
+```
+
+Register it in your project's `.mcp.json`:
+
+```json
+{ "mcpServers": { "quelltest": { "command": "quelltest-mcp" } } }
+```
+
+Tools exposed: `find_edge_cases`, `write_verified_tests`, `get_prs_score`,
+`prove_file`, `reproduce_bug`.
+
+**Claude Code plugin** (bundles a skill that teaches Claude the workflow):
+
+```
+/plugin marketplace add quelltest/quelltest-lib
+/plugin install quelltest@quelltest
+```
+
+Then `/quelltest find src/`, `/quelltest fix src/`, `/quelltest score`, or
+just ask Claude to "write proven tests for the payments module".
+
+---
+
 ## Development
 
 ```bash
