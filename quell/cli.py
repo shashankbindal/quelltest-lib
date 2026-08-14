@@ -79,6 +79,29 @@ def _make_console() -> Console:
 console = _make_console()
 
 
+def _skip_outcome_map() -> dict:
+    """Map each SkipReason to the report's coarse outcome bucket.
+
+    The buckets are kept as-is so existing report consumers and the summary
+    counters keep working; the precise cause travels alongside them in
+    `skip_reason`, so nothing is lost by the coarse grouping.
+    """
+    from quell.core.models import SkipReason
+
+    return {
+        SkipReason.SELF_ATTRIBUTE_GUARD: "skipped_local_var",
+        SkipReason.LOCAL_VARIABLE_GUARD: "skipped_local_var",
+        SkipReason.ALL_PARAMS_UNKNOWN: "skipped_local_var",
+        SkipReason.UNDETERMINED_PARAM: "skipped_local_var",
+        SkipReason.OPTIONAL_RETURN: "skipped_no_rule",
+        SkipReason.MODULE_STATE_GUARD: "skipped_no_rule",
+        SkipReason.NO_RULE_FOR_KIND: "skipped_no_rule",
+    }
+
+
+_SKIP_OUTCOME = _skip_outcome_map()
+
+
 def _safe_glyph(preferred: str, fallback: str) -> str:
     """Return `preferred` only if the active stdout encoding can render it.
 
@@ -492,17 +515,16 @@ def _run_find_impl(
             candidate = rule_engine.generate(req)
             generated_by_tag = "[dim][rule-based, no network][/dim]"
             if candidate is None:
-                # Async is now handled via asyncio.run wrap; only structural
-                # reasons cause a None return: self.attr or local variable.
-                if "self." in (req.raw_spec_text or ""):
-                    item["outcome"] = "skipped_local_var"
-                    item["reason"] = "guard checks self.attr — needs class instantiation"
-                else:
-                    item["outcome"] = "skipped_local_var"
-                    item["reason"] = (
-                        "guard variable is a local variable (DB result, computed value) "
-                        "not a function parameter — can't inject via stub"
-                    )
+                # Ask the engine why rather than re-deriving it here. This block
+                # used to repeat the engine's own `"self." in raw_spec_text`
+                # check and label everything skipped_local_var, so five distinct
+                # causes were reported as one and the two could drift apart.
+                # spec10 non-negotiable #6 — every skip is typed and reported.
+                reason = rule_engine.last_skip
+                item["outcome"] = _SKIP_OUTCOME.get(reason, "skipped_local_var")
+                item["reason"] = reason.value if reason else "generator declined"
+                if reason is not None:
+                    item["skip_reason"] = reason.name
                 _write_scaffold(req, None, 2, config, project_root, item, scaffolded_files, console, fmt)
                 report_items.append(item)
                 continue

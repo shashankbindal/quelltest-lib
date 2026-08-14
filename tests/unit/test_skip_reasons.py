@@ -125,3 +125,14 @@ def test_skip_helper_records_and_declines(reason: SkipReason):
     engine = RuleEngine()
     assert engine._skip(reason) is None
     assert engine.last_skip == reason
+
+
+# ── the reasons reach the user (G5) ──────────────────────────────────────────
+
+
+def test_every_skip_reason_maps_to_a_report_bucket():
+    """No reason may fall through to the default bucket unclassified."""
+    from quell.cli import _SKIP_OUTCOME
+
+    assert set(_SKIP_OUTCOME) == set(SkipReason)
+    assert set(_SKIP_OUTCOME.values()) <= {"skipped_local_var", "skipped_no_rule"}
