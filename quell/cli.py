@@ -198,7 +198,7 @@ def _load_config(project_root: Path) -> QuellConfig:
         import tomllib
         pyproject = project_root / "pyproject.toml"
         if pyproject.exists():
-            data = tomllib.loads(pyproject.read_text())
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
             quell_cfg = data.get("tool", {}).get("quell", {})
             if quell_cfg:
                 return QuellConfig(**quell_cfg)
@@ -291,6 +291,7 @@ def cmd_find(
         fmt=fmt,
         show_all=show_all,
         measure=measure,
+        auto=auto,
     )
 
     if sync:
@@ -309,6 +310,7 @@ def _run_find_impl(
     fmt: str = "console",
     show_all: bool = False,
     measure: bool = False,
+    auto: bool = False,
 ) -> None:
     """Shared implementation called by `quell find`."""
     # Fully synchronous — no asyncio.run() at the top level.
@@ -623,7 +625,12 @@ def _run_find_impl(
                     )
                     console.print(Syntax(fix_suggestion.diff, "diff", theme="monokai"))
 
-            write = typer.confirm("  Write this test?", default=True)
+            # --auto was declared on `quell find` but never forwarded here, so
+            # the prompt ran even in CI: stdin is EOF there, click aborts, and
+            # the command exits 1. The integration test that runs `--fix --auto`
+            # passed only because no candidate on its fixture ever reached this
+            # line.
+            write = True if auto else typer.confirm("  Write this test?", default=True)
             if write:
                 if writer.write(candidate, req.id):
                     console.print(
@@ -1033,11 +1040,21 @@ def cmd_score(
         for req in gaps:
             test = engine.generate(req)
             if test is not None:
+                # A generated test is NOT a verified one. This bucketed every
+                # candidate as WRITTEN with gates_passed=5 purely because
+                # generate() returned non-None -- the verifier never ran. On
+                # tests/fixtures/async_orm_project that produced
+                # `quell score` = 100/100 Production Ready against
+                # `quell find` = 20/100 Edge Cases Uncovered on the same
+                # directory, and `--badge` would stamp the green one on a README.
+                #
+                # Claiming five gates passed when none were run is the defect
+                # spec10 non-negotiable #1 exists for, in a path #156 did not
+                # touch. SCAFFOLDED is what an unverified candidate is.
                 scan_results.append(BucketedResult(
                     requirement_id=req.id,
-                    bucket=OutputBucket.WRITTEN,
-                    gates_passed=5,
-                    confidence_score=80,
+                    bucket=OutputBucket.SCAFFOLDED,
+                    gates_passed=3,
                 ))
             else:
                 scan_results.append(BucketedResult(
@@ -1135,7 +1152,7 @@ def cmd_init(
         console.print("[red]No pyproject.toml found. Create one first.[/red]")
         raise typer.Exit(1)
 
-    content = pyproject.read_text()
+    content = pyproject.read_text(encoding="utf-8")
     if "[tool.quell]" in content:
         console.print("[yellow][tool.quell] already exists in pyproject.toml[/yellow]")
         return
@@ -1155,7 +1172,7 @@ enable_types = true
 enable_mutations = false
 enable_pyspark = false
 """
-    pyproject.write_text(content + quell_block)
+    pyproject.write_text(content + quell_block, encoding="utf-8")
     console.print("[green]Added [tool.quell] to pyproject.toml[/green]")
     console.print("  LLM fallback is off by default (use_llm = false).")
     console.print("  To enable: [bold]quell auth set --provider groq --key sk-...[/bold]")
@@ -1285,18 +1302,18 @@ def _install_precommit_hook(project_root: Path) -> None:
     hooks:
       - id: quell
         name: Quell — verify requirements
-        entry: quell check --diff-only --no-llm --auto
+        entry: quell find --fix --auto
         language: system
         types: [python]
         pass_filenames: false
 """
     if config_file.exists():
-        if "id: quell" in config_file.read_text():
+        if "id: quell" in config_file.read_text(encoding="utf-8"):
             console.print("[yellow]Quell hook already in .pre-commit-config.yaml[/yellow]")
             return
-        config_file.write_text(config_file.read_text() + hook_entry)
+        config_file.write_text(config_file.read_text() + hook_entry, encoding="utf-8")
     else:
-        config_file.write_text(f"repos:{hook_entry}")
+        config_file.write_text(f"repos:{hook_entry}", encoding="utf-8")
 
     console.print("[green]Added Quell to .pre-commit-config.yaml[/green]")
     console.print("  Runs on every git commit (changed files only, < 3 seconds)")
@@ -1311,7 +1328,7 @@ def _install_github_action(project_root: Path) -> None:
         console.print("[yellow]quell.yml already in .github/workflows/[/yellow]")
         return
 
-    action_file.write_text(GITHUB_ACTION_YAML)
+    action_file.write_text(GITHUB_ACTION_YAML, encoding="utf-8")
     console.print("[green]Created .github/workflows/quell.yml[/green]")
     console.print("\nNext steps:")
     console.print("  1. Add QUELL_API_KEY to GitHub repo secrets")
@@ -1717,7 +1734,7 @@ def sync_status(
     last_push = "never"
     if history_file.exists():
         try:
-            history = _j.loads(history_file.read_text())
+            history = _j.loads(history_file.read_text(encoding="utf-8"))
             if history:
                 last_push = history[-1].get("run_at", "unknown")
         except Exception:  # noqa: BLE001
@@ -1745,7 +1762,7 @@ def sync_history(
         return
 
     try:
-        history = _j.loads(history_file.read_text())
+        history = _j.loads(history_file.read_text(encoding="utf-8"))
     except Exception:  # noqa: BLE001
         console.print("[red]Could not read sync history.[/red]")
         return
@@ -1808,7 +1825,7 @@ def sync_unlink(
             # Clear local history
             history_file = project_root / ".quell" / "sync_history.json"
             if history_file.exists():
-                history_file.write_text(_j.dumps([]))
+                history_file.write_text(_j.dumps([]), encoding="utf-8")
         else:
             console.print(f"[red]Unlink failed: server returned {resp.status_code}[/red]")
             raise typer.Exit(1)
