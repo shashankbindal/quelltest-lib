@@ -382,7 +382,9 @@ class RuleEngine:
         if vi.get("len_check"):
             boundary_call = _inject_short_string(call, str(vi.get("variable", "")))
         else:
-            boundary_call = _inject_boundary_value(call, req.description)
+            boundary_call = _inject_boundary_value(
+                call, req.description, target=str(vi.get("variable") or "") or None
+            )
         wrapped = self._wrap_call(boundary_call, req)
 
         code = f"""def {name}{fixture_str}:
@@ -813,7 +815,7 @@ def _append_kwarg(call: str, kwarg: str) -> str:
     return f"{base}{sep}{kwarg})"
 
 
-def _inject_boundary_value(call: str, description: str) -> str:
+def _inject_boundary_value(call: str, description: str, target: str | None = None) -> str:
     """Replace the first numeric stub in call with a boundary-violating value."""
     boundary_val = "0"
     desc_lower = description.lower()
@@ -828,11 +830,20 @@ def _inject_boundary_value(call: str, description: str) -> str:
     elif "between 0 and 100" in desc_lower:
         boundary_val = "-1"
 
-    # Replace first integer stub (=1 or =0) with boundary value
-    modified = re.sub(r"=\b\d+\b", f"={boundary_val}", call, count=1)
-    if modified == call:
-        modified = _append_kwarg(call, f"value={boundary_val}")
-    return modified
+    # Target the guard's own variable at the TOP level of the call. Before
+    # #144 every argument was a literal, so 'first =<digits>' was harmless;
+    # now an argument can be a nested constructor whose own literals match
+    # first, corrupting it and leaving the real parameter untouched.
+    if target:
+        replaced = _replace_top_level_arg(call, target, boundary_val)
+        if replaced is not None:
+            return replaced
+
+    for _name, vstart, vend in _top_level_kwargs(call):
+        if call[vstart:vend].strip().isdigit():
+            return call[:vstart] + boundary_val + call[vend:]
+
+    return _append_kwarg(call, f"value={boundary_val}")
 
 
 def _project_root(file_path: Path) -> Path:
@@ -848,3 +859,61 @@ def _project_root(file_path: Path) -> Path:
             return current
         current = current.parent
     return file_path.parent.parent
+
+
+def _top_level_kwargs(call: str) -> list[tuple[str, int, int]]:
+    """Return (name, value_start, value_end) for each top-level `name=value`.
+
+    Only depth-1 arguments of the outermost call. Since #144 an argument can be
+    a whole nested constructor --
+    `Account(id=1, owner_email='a@example.com')` -- and a naive regex for
+    `=<digits>` matches `id=1` inside it rather than the parameter being
+    violated. That silently mutated a constructor literal and left the target
+    argument untouched, so the guard never fired and Gate 4 rejected the test.
+    Found by the ablation harness on tests/fixtures/no_fixture_project.
+    """
+    open_paren = call.find("(")
+    if open_paren == -1:
+        return []
+
+    depth = 0
+    spans: list[tuple[str, int, int]] = []
+    name_start = open_paren + 1
+    in_str: str | None = None
+    i = open_paren
+    while i < len(call):
+        ch = call[i]
+        if in_str is not None:
+            if ch == in_str and call[i - 1] != "\\":
+                in_str = None
+        elif ch in ("'", '"'):
+            in_str = ch
+        elif ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                spans.append((call[name_start:i], name_start, i))
+                break
+        elif ch == "," and depth == 1:
+            spans.append((call[name_start:i], name_start, i))
+            name_start = i + 1
+        i += 1
+
+    out: list[tuple[str, int, int]] = []
+    for text, start, end in spans:
+        eq = text.find("=")
+        if eq == -1:
+            continue
+        name = text[:eq].strip()
+        if name.isidentifier():
+            out.append((name, start + eq + 1, end))
+    return out
+
+
+def _replace_top_level_arg(call: str, name: str, new_value: str) -> str | None:
+    """Replace one top-level argument's value, leaving nested calls untouched."""
+    for arg_name, vstart, vend in _top_level_kwargs(call):
+        if arg_name == name:
+            return call[:vstart] + new_value + call[vend:]
+    return None
