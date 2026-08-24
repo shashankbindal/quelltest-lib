@@ -236,6 +236,13 @@ class RuleEngine:
         else:
             call = f"{func}({call_args})"
 
+        # Rung 3 (#145). This call was missing entirely: _apply_guard_mock was
+        # defined but never invoked, so the rung shipped as dead code and the
+        # ablation's A3 column could never differ from A2. Applied here, at the
+        # single point where the call expression is finished, so every
+        # constraint kind gets it rather than eight generators each remembering.
+        call = self._apply_guard_mock(call, req, sig)
+
         fixture_str = f"({', '.join(dict.fromkeys(fixtures))})" if fixtures else "()"
         return call, fixture_str, list(dict.fromkeys(fixtures)), unknown
 
@@ -294,6 +301,17 @@ class RuleEngine:
         guard = guard_mock.parse_guard(req.raw_spec_text)
         if guard is None:
             return call
+
+        # Rung 2 + rung 3, composed. If the parameter already carries a mined
+        # construction, violate the guarded attribute on that real object
+        # rather than declining because it is not `=None`. A real object with
+        # one field violated is a better test subject than a mock.
+        violated = _violate_mined_construction(
+            call, guard.obj, guard.attr, guard.violating
+        )
+        if violated is not None:
+            return violated
+
         # Only substitute a parameter we actually gave up on.
         if not re.search(rf"{re.escape(guard.obj)}\s*=\s*None", call):
             return call
@@ -861,6 +879,46 @@ def _project_root(file_path: Path) -> Path:
     return file_path.parent.parent
 
 
+
+def _final_call_open_paren(expr: str) -> int:
+    """Index of the `(` that opens the LAST call in a chained expression.
+
+    `_top_level_kwargs` originally took the first `(`. For a mined construction
+    that is the wrong one:
+
+        __import__('app.models', fromlist=['Account']).Account(id=1, ...)
+                  ^ first                             ^ the one we want
+
+    Taking the first parsed `__import__`'s arguments, so a guard on
+    `account.owner_email` found no `owner_email` argument and declined --
+    which is why rung 3 appeared to do nothing even once it was wired in.
+
+    Works backwards from the final `)` to its match, skipping string literals.
+    """
+    expr = expr.rstrip()
+    if not expr.endswith(")"):
+        return expr.find("(")
+
+    depth = 0
+    i = len(expr) - 1
+    in_str: str | None = None
+    while i >= 0:
+        ch = expr[i]
+        if in_str is not None:
+            if ch == in_str and (i == 0 or expr[i - 1] != "\\"):
+                in_str = None
+        elif ch in ("'", '"'):
+            in_str = ch
+        elif ch == ")":
+            depth += 1
+        elif ch == "(":
+            depth -= 1
+            if depth == 0:
+                return i
+        i -= 1
+    return expr.find("(")
+
+
 def _top_level_kwargs(call: str) -> list[tuple[str, int, int]]:
     """Return (name, value_start, value_end) for each top-level `name=value`.
 
@@ -872,7 +930,7 @@ def _top_level_kwargs(call: str) -> list[tuple[str, int, int]]:
     argument untouched, so the guard never fired and Gate 4 rejected the test.
     Found by the ablation harness on tests/fixtures/no_fixture_project.
     """
-    open_paren = call.find("(")
+    open_paren = _final_call_open_paren(call)
     if open_paren == -1:
         return []
 
@@ -916,4 +974,35 @@ def _replace_top_level_arg(call: str, name: str, new_value: str) -> str | None:
     for arg_name, vstart, vend in _top_level_kwargs(call):
         if arg_name == name:
             return call[:vstart] + new_value + call[vend:]
+    return None
+
+
+def _violate_mined_construction(call: str, obj: str, attr: str, violating: str) -> str | None:
+    """Set `attr` to a violating value inside the construction passed as `obj`.
+
+    Rungs 2 and 3 were mutually exclusive: `_apply_guard_mock` only fires on a
+    parameter still stubbed `=None`, and rung 2 replaces that with a real
+    constructor call. So once a construction was mined, nothing could make an
+    attribute guard fire -- rung 2 supplies a *valid* object and rung 3 cannot
+    run. Both attribute guards in tests/fixtures/no_fixture_project failed for
+    exactly this reason (see benchmarks/ABLATION.md).
+
+    A real object with one field violated beats a mock: the rest of the object
+    stays authentic, so the guard fires for the right reason rather than
+    because everything around it is a Mock.
+
+        Account(id=1, owner_email='a@example.com')
+     -> Account(id=1, owner_email='')
+
+    Returns None when the constructor does not pass `attr` as a keyword, since
+    appending one could hit an unexpected-keyword TypeError.
+    """
+    for name, vstart, vend in _top_level_kwargs(call):
+        if name != obj:
+            continue
+        inner = call[vstart:vend]
+        replaced = _replace_top_level_arg(inner, attr, violating)
+        if replaced is None or replaced == inner:
+            return None
+        return call[:vstart] + replaced + call[vend:]
     return None

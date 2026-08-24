@@ -101,7 +101,7 @@ arm                           gaps   gen  verified   yield
 A0 literal stubs only            3     3         0      0%
 A1 + conftest fixtures           3     3         0      0%
 A2 + mined constructions         3     3         1     33%
-A3 + guard-aware mocks           3     3         1     33%
+A3 + guard-aware mocks           3     3         2     67%
 ```
 
 **Rung 2 (#144) is confirmed working for the first time: 0 → 1.**
@@ -121,21 +121,23 @@ could be a nested constructor, the first `=<digits>` was `id=1` *inside*
 guard never fired, and Gate 4 rejected the test. Fixed by targeting top-level
 arguments only, preferring the guard's own variable.
 
-**Rung 3 (#145) still does not fire, and now we know exactly why.**
-`_apply_guard_mock` requires `<param>=None` in the call
-(`rule_engine.py:298`). Rung 2 replaces that with a real construction, so the
-precondition is gone:
+**Rung 3 (#145) had never run at all.** The earlier explanation here -- that
+rung 3 was unreachable whenever rung 2 succeeded -- was wrong. The real cause
+was simpler: `_apply_guard_mock` was defined and **never called**. #145 shipped
+as dead code, so the A3 column could not differ from A2 under any conditions.
 
-> **Rung 3 is unreachable whenever rung 2 succeeds.** They are mutually
-> exclusive by construction, and rung 2 runs first.
+Two further bugs sat behind it once it was wired in:
 
-The two gaps still unverified here are both attribute guards
-(`if not account.owner_email:`, `if invoice.settled:`). Neither rung produces a
-*violating* object: rung 2 supplies a valid one, rung 3 cannot run. The correct
-behaviour is to take the mined construction and violate the guarded attribute --
-`Account(id=1, owner_email='')` -- which nothing currently does.
+- Rungs 2 and 3 were written as alternatives. `_apply_guard_mock` only fired on
+  a parameter still stubbed `=None`, which rung 2 had already replaced with a
+  real constructor. They now compose: the guarded attribute is violated *on*
+  the mined construction (`Account(owner_email=None)`), which is a better test
+  subject than a mock because the rest of the object stays authentic.
+- `_top_level_kwargs` took the first `(` in an expression. For a mined
+  construction that is `__import__(`, not the constructor, so it parsed the
+  wrong argument list and found no attribute to violate.
 
-That is the highest-value open item on the ladder.
+After all three fixes, A3 reaches 2 of 3 on this fixture.
 
 ## Reading these tables honestly
 
@@ -153,8 +155,9 @@ What would strengthen it, in order:
 1. ~~A second fixture with no matching conftest fixtures.~~ Done -- it is
    `no_fixture_project`, and it confirmed rung 2 while exposing the boundary
    bug and the rung-2/rung-3 conflict above.
-2. Make rung 2 and rung 3 compose: violate the guarded attribute *on* the mined
-   construction, instead of treating a real object and a mock as alternatives.
-   That is what would close the two attribute guards still failing.
+2. ~~Make rung 2 and rung 3 compose.~~ Done. Every rung now has at least one
+   project where it demonstrably contributes: rung 1 on the async fixture
+   (0 -> 3), rung 2 here (0 -> 1), rung 3 here (1 -> 2).
 3. A real third-party async backend, which is the population spec10 §0 came
-   from.
+   from. Still the only thing that would settle whether any of this holds at
+   scale -- two small fixtures are not a benchmark.
