@@ -155,8 +155,12 @@ jobs:
         run: uv run python benchmarks/ablation.py tests/fixtures/no_fixture_project
 
       - name: Assert every rung still contributes
+        # `uv run`, not bare python3: the assertion shells out with
+        # sys.executable, and the system interpreter has no `quell` installed,
+        # so ablation.py exited 1 on import and the step failed for the wrong
+        # reason. Under uv run, sys.executable is the project venv.
         run: |
-          python3 - <<'PY'
+          uv run python - <<'PY'
           import re, subprocess, sys
 
           def yields(project):
