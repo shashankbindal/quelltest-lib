@@ -236,12 +236,17 @@ class RuleEngine:
         else:
             call = f"{func}({call_args})"
 
-        # Rung 3 (#145). This call was missing entirely: _apply_guard_mock was
-        # defined but never invoked, so the rung shipped as dead code and the
-        # ablation's A3 column could never differ from A2. Applied here, at the
-        # single point where the call expression is finished, so every
-        # constraint kind gets it rather than eight generators each remembering.
-        call = self._apply_guard_mock(call, req, sig)
+        # Rung 3 (#145) is applied by the kinds that want a pre-violated
+        # argument, NOT here.
+        #
+        # It was briefly applied at this point, for every constraint kind. That
+        # is wrong: a BOUNDARY requirement on `amount_cents` mutates its own
+        # parameter, and pre-violating an unrelated one means the function
+        # raises at the earlier guard and never reaches the boundary check. The
+        # resulting test passes whether or not the guard it names still exists
+        # -- it survives that guard being deleted outright, which is exactly
+        # what Gate 5 is supposed to catch. Kinds that mutate their own argument
+        # must receive a VALID call to mutate.
 
         fixture_str = f"({', '.join(dict.fromkeys(fixtures))})" if fixtures else "()"
         return call, fixture_str, list(dict.fromkeys(fixtures)), unknown
@@ -313,7 +318,7 @@ class RuleEngine:
             return violated
 
         # Only substitute a parameter we actually gave up on.
-        if not re.search(rf"{re.escape(guard.obj)}\s*=\s*None", call):
+        if not re.search(rf"\b{re.escape(guard.obj)}\s*=\s*None\b", call):
             return call
 
         type_name = None
@@ -328,7 +333,7 @@ class RuleEngine:
         if expr is None:
             return call
         return re.sub(
-            rf"{re.escape(guard.obj)}\s*=\s*None", f"{guard.obj}={expr}", call, count=1
+            rf"\b{re.escape(guard.obj)}\s*=\s*None\b", f"{guard.obj}={expr}", call, count=1
         )
 
     def _wrap_call(self, call: str, req: Requirement) -> str:
@@ -367,6 +372,8 @@ class RuleEngine:
                 exc = candidate
 
         call, fixture_str, fixtures, unknown = self._sig_info(req)
+        sig = sig_inspector.inspect(req.target_function, req.target_file)
+        call = self._apply_guard_mock(call, req, sig)
         imp = self._import_line(req)
         setup = ""
         name = self._name(req)
@@ -731,6 +738,8 @@ class RuleEngine:
                 return self._skip(SkipReason.MODULE_STATE_GUARD)
 
         call, fixture_str, fixtures, unknown = self._sig_info(req)
+        sig = sig_inspector.inspect(req.target_function, req.target_file)
+        call = self._apply_guard_mock(call, req, sig)
         imp = self._import_line(req)
         setup = self._setup_lines(fixtures)
         name = self._name(req)
