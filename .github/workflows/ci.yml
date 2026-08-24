@@ -31,7 +31,13 @@ jobs:
         run: uv sync --all-extras --dev
 
       - name: Lint (ruff)
-        run: uv run ruff check quell/ --output-format=github
+        # tests/ and benchmarks/ were previously unlinted, so lint errors could
+        # land there unnoticed. tests/fixtures/ is excluded on purpose: those
+        # are miniature stand-in projects that imitate a user's repo, and
+        # holding them to this project's lint config would be wrong.
+        run: >
+          uv run ruff check quell/ tests/ benchmarks/
+          --exclude tests/fixtures --output-format=github
 
       - name: Type check (mypy)
         # mypy strict on 3.11+; relax on 3.10 for forward-compat annotations
@@ -67,28 +73,43 @@ jobs:
       - name: Install Quell
         run: uv sync
 
+      # `quell check` was REMOVED in v1.2 and exits 1; `--format json` does not
+      # exist. Both failures were swallowed by `|| true`, and the parser below
+      # read keys (`gaps`, `score`) that are not in the report schema. This job
+      # was green on every PR while doing nothing at all.
       - name: Run Quell on itself
-        run: |
-          uv run quell check quell/ --no-llm --format json > quell_self_report.json || true
+        run: uv run quell find quell/ --format github
 
-      - name: Show Quell self-report
+      - name: Assert the self-report is well formed
         run: |
-          python3 -c "
-          import json
-          try:
-            r = json.load(open('quell_self_report.json'))
-            print(f'Total requirements: {r[\"total_requirements\"]}')
-            print(f'Gaps: {len(r[\"gaps\"])}')
-            print(f'Score: {int(r[\"score\"]*100)}%')
-          except Exception as e:
-            print(f'Could not parse report: {e}')
-          "
+          python3 - <<'PY'
+          import json, pathlib, sys
+
+          path = pathlib.Path("quell-report.json")
+          if not path.exists():
+              sys.exit("quell-report.json was not written")
+
+          report = json.loads(path.read_text(encoding="utf-8"))
+          summary = report.get("summary", {})
+
+          # Keys the installed GitHub Action template reads. If any of these
+          # disappear the action silently reports 0/100 - which is exactly what
+          # issue #135 was.
+          required = ["total_requirements", "gaps_found", "verified_and_written"]
+          missing = [k for k in required if k not in summary]
+          if missing:
+              sys.exit(f"report summary missing keys the Action reads: {missing}")
+
+          print(f"requirements : {summary['total_requirements']}")
+          print(f"gaps         : {summary['gaps_found']}")
+          print(f"written      : {summary['verified_and_written']}")
+          PY
 
       - name: Upload self-report
         uses: actions/upload-artifact@v4
         with:
           name: quell-self-report
-          path: quell_self_report.json
+          path: quell-report.json
 
   release-check:
     name: Check package builds
@@ -102,3 +123,75 @@ jobs:
           python-version: "3.11"
       - run: uv build
       - run: uvx twine check dist/*
+
+  ablation:
+    name: Ladder ablation (yield regression)
+    runs-on: ubuntu-latest
+    needs: test
+
+    # The §4.4 strategy ladder shipped three times with green unit tests while
+    # doing nothing in practice: #144 was broken by its own boundary-injection
+    # regression, #145 was never called at all, and both were only caught by
+    # running the harness end to end. Unit tests prove the pieces work in
+    # isolation; this proves they are still connected.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Quell
+        run: uv sync --all-extras --dev
+
+      - name: Ablation on the async/ORM fixture
+        run: uv run python benchmarks/ablation.py tests/fixtures/async_orm_project
+
+      - name: Ablation on the no-fixture control
+        run: uv run python benchmarks/ablation.py tests/fixtures/no_fixture_project
+
+      - name: Assert every rung still contributes
+        # `uv run`, not bare python3: the assertion shells out with
+        # sys.executable, and the system interpreter has no `quell` installed,
+        # so ablation.py exited 1 on import and the step failed for the wrong
+        # reason. Under uv run, sys.executable is the project venv.
+        run: |
+          uv run python - <<'PY'
+          import re, subprocess, sys
+
+          def yields(project):
+              out = subprocess.run(
+                  [sys.executable, "benchmarks/ablation.py", project],
+                  capture_output=True, text=True, check=True,
+              ).stdout
+              found = {}
+              for line in out.splitlines():
+                  m = re.match(r"(A\d)\b.*?\s(\d+)\s+(\d+)%\s", line)
+                  if m:
+                      found[m.group(1)] = int(m.group(2))
+              return found
+
+          asyncp = yields("tests/fixtures/async_orm_project")
+          nofix = yields("tests/fixtures/no_fixture_project")
+          print("async :", asyncp)
+          print("nofix :", nofix)
+
+          failures = []
+          # Rung 1 (#143) carries the async fixture.
+          if not asyncp.get("A1", 0) > asyncp.get("A0", 0):
+              failures.append("rung 1 (conftest fixtures) no longer contributes on async_orm_project")
+          # Rung 2 (#144) is the only thing that fires on the no-fixture control.
+          if not nofix.get("A2", 0) > nofix.get("A1", 0):
+              failures.append("rung 2 (mined constructions) no longer contributes on no_fixture_project")
+          # Rung 3 (#145) shipped dead once already - pin it.
+          if not nofix.get("A3", 0) > nofix.get("A2", 0):
+              failures.append("rung 3 (guard-aware mocks) no longer contributes on no_fixture_project")
+
+          if failures:
+              sys.exit("ABLATION REGRESSION:\n  " + "\n  ".join(failures))
+          print("\nall three rungs still contribute")
+          PY
