@@ -88,6 +88,55 @@ spec10 §0. On that shape it takes yield 0% → 75%. On library-shaped code it i
 inert — neither helping nor hurting (runtime is flat across arms, so the
 discovery passes cost nothing measurable).
 
+## Result — tests/fixtures/no_fixture_project (the control for rungs 2 and 3)
+
+A project deliberately built so rung 1 *cannot* fire: no conftest fixture
+matches any parameter name. Domain objects are constructed with literal
+arguments elsewhere (rung 2's input), and guards read attributes off complex
+parameters (rung 3's input).
+
+```
+arm                           gaps   gen  verified   yield
+-----------------------------------------------------------
+A0 literal stubs only            3     3         0      0%
+A1 + conftest fixtures           3     3         0      0%
+A2 + mined constructions         3     3         1     33%
+A3 + guard-aware mocks           3     3         1     33%
+```
+
+**Rung 2 (#144) is confirmed working for the first time: 0 → 1.**
+
+It took a bug fix to get there. The first run of this fixture returned 0 for
+every arm, because rung 2 broke boundary injection:
+
+```
+if amount_cents <= 0:     ->  settle(account=Account(id=0, ...), amount_cents=1)
+                                              ^^^^ mutated, and not the target
+```
+
+`_inject_boundary_value` used `re.sub(r"=\d+", ..., count=1)`, which
+before #144 was harmless because every argument was a literal. Once an argument
+could be a nested constructor, the first `=<digits>` was `id=1` *inside*
+`Account(...)`. The constructor was corrupted, `amount_cents` was left at 1, the
+guard never fired, and Gate 4 rejected the test. Fixed by targeting top-level
+arguments only, preferring the guard's own variable.
+
+**Rung 3 (#145) still does not fire, and now we know exactly why.**
+`_apply_guard_mock` requires `<param>=None` in the call
+(`rule_engine.py:298`). Rung 2 replaces that with a real construction, so the
+precondition is gone:
+
+> **Rung 3 is unreachable whenever rung 2 succeeds.** They are mutually
+> exclusive by construction, and rung 2 runs first.
+
+The two gaps still unverified here are both attribute guards
+(`if not account.owner_email:`, `if invoice.settled:`). Neither rung produces a
+*violating* object: rung 2 supplies a valid one, rung 3 cannot run. The correct
+behaviour is to take the mined construction and violate the guarded attribute --
+`Account(id=1, owner_email='')` -- which nothing currently does.
+
+That is the highest-value open item on the ladder.
+
 ## Reading these tables honestly
 
 A flat yield across A1–A3 means "these rungs did not fire here", not "these
@@ -101,8 +150,11 @@ reproduces that failure exactly — but one small fixture is not a benchmark.
 
 What would strengthen it, in order:
 
-1. A second async/ORM fixture with *no* matching conftest fixtures, so rungs 2
-   and 3 have a chance to fire at all. Neither has yet been observed doing
-   anything on any project.
-2. A real third-party async backend, which is the population spec10 §0 came
+1. ~~A second fixture with no matching conftest fixtures.~~ Done -- it is
+   `no_fixture_project`, and it confirmed rung 2 while exposing the boundary
+   bug and the rung-2/rung-3 conflict above.
+2. Make rung 2 and rung 3 compose: violate the guarded attribute *on* the mined
+   construction, instead of treating a real object and a mock as alternatives.
+   That is what would close the two attribute guards still failing.
+3. A real third-party async backend, which is the population spec10 §0 came
    from.

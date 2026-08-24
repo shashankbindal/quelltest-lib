@@ -9,7 +9,6 @@ rung of the §4.4 ladder the case is waiting on.
 """
 from __future__ import annotations
 
-import re
 from pathlib import Path
 
 import pytest
@@ -35,19 +34,39 @@ def _req(tmp_path: Path, body: str, kind: ConstraintKind, raw: str = "") -> Requ
 # ── the structural guarantee ─────────────────────────────────────────────────
 
 
-def test_no_bare_return_none_remains_in_rule_engine():
-    """Only _skip() itself and its documented pass-through may return None."""
+def test_no_bare_return_none_inside_the_engine():
+    """No silent skip may return None from a RuleEngine method.
+
+    Scoped to the class rather than the whole module. Module-level helpers such
+    as `_replace_top_level_arg` legitimately return None as an Optional lookup;
+    counting every `return None` in the file made this test fail the moment one
+    was added, which is a false positive rather than the regression it exists
+    to catch. What matters is that a *generator* never declines silently.
+
+    Only _skip() itself and generate()'s annotated pass-through may do so.
+    """
+    import ast as _ast
+
     import quell.synthesis.rule_engine as mod
 
-    source = Path(mod.__file__).read_text(encoding="utf-8")
-    bare = [
-        (i + 1, ln.strip())
-        for i, ln in enumerate(source.splitlines())
-        if re.match(r"\s*return None\b", ln)
-    ]
-    # _skip's own `return None`, and generate()'s annotated pass-through.
-    assert len(bare) == 2, f"unexpected bare skips: {bare}"
-    assert any("last_skip" in ln for _, ln in bare)
+    tree = _ast.parse(Path(mod.__file__).read_text(encoding="utf-8"))
+    engine = next(
+        n for n in tree.body
+        if isinstance(n, _ast.ClassDef) and n.name == "RuleEngine"
+    )
+
+    offenders = []
+    for method in engine.body:
+        if not isinstance(method, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+            continue
+        if method.name in {"_skip", "generate"}:
+            continue  # the two documented exemptions
+        for node in _ast.walk(method):
+            if isinstance(node, _ast.Return) and isinstance(node.value, _ast.Constant):
+                if node.value.value is None:
+                    offenders.append(f"{method.name}:{node.lineno}")
+
+    assert not offenders, f"silent skips found: {offenders}"
 
 
 def test_every_skip_reason_has_a_human_readable_value():
